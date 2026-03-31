@@ -1,3 +1,4 @@
+source activate align
 #!/bin/bash
 set -e
 echo "=== Stage 1: SFT on UltraChat-200k ==="
