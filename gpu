@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+gpu - 一站式远程 GPU 训练工具
+
+用法:
+    ./gpu setup              首次配置（只需跑一次）
+    ./gpu train [args]       一键训练：push → 开机 → 装依赖 → 训练 → 下载结果 → 关机
+    ./gpu run <command>      远程执行任意命令（自动开机，完成后自动关机）
+    ./gpu ssh                SSH 进去（自动开机）
+    ./gpu up                 只开机
+    ./gpu down               只关机
+    ./gpu status             查看实例状态和花费
+    ./gpu download [path]    下载远程文件到本地
+    ./gpu destroy            销毁实例（省存储费，数据全丢）
+    ./gpu cost               本月花了多少钱
+
+示例:
+    ./gpu train                                    # 用默认参数跑 train.py
+    ./gpu train --epochs 100 --lr 0.001            # 自定义参数
+    ./gpu train --script eval.py                   # 跑别的脚本
+    ./gpu run "nvidia-smi"                         # 远程看 GPU 状态
+    ./gpu run "pip install wandb"                   # 远程装包
+    ./gpu download results/checkpoints/best.pth    # 下载单个文件
+"""
+
+import subprocess
+import sys
+import os
+import json
+import time
+import re
+from pathlib import Path
+from datetime import datetime
+
+# ============================================================
+# 配置文件路径
+# ============================================================
+CONFIG_DIR = Path.home() / ".gpu-tool"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# ============================================================
+# 默认配置
+# ============================================================
+DEFAULT_CONFIG = {
+    "instance_id": "",
+    "github_repo": "",        # e.g., https://TOKEN@github.com/user/repo.git
+    "remote_project_dir": "/workspace/project",
+    "local_results_dir": "./results",
+    "train_script": "train.py",
+    "default_train_args": "",
+    "docker_image": "pytorch/pytorch:latest",
+    "startup_wait_seconds": 45,
+    "auto_shutdown": True,    # 训练完自动关机
+    "auto_install_deps": True,
+    "ssh_key": str(Path.home() / ".ssh/id_ed25519"),
+}
+
+# ============================================================
+# 颜色输出
+# ============================================================
+class C:
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    RED    = "\033[91m"
+    CYAN   = "\033[96m"
+    DIM    = "\033[2m"
+    BOLD   = "\033[1m"
+    END    = "\033[0m"
+
+def info(msg):    print(f"{C.CYAN}→{C.END} {msg}")
+def ok(msg):      print(f"{C.GREEN}✓{C.END} {msg}")
+def warn(msg):    print(f"{C.YELLOW}⚠{C.END} {msg}")
+def err(msg):     print(f"{C.RED}✗{C.END} {msg}")
+def step(n, msg): print(f"\n{C.BOLD}{C.CYAN}[{n}]{C.END} {C.BOLD}{msg}{C.END}")
+
+# ============================================================
+# 配置管理
+# ============================================================
+def load_config():
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            saved = json.load(f)
+        # merge with defaults (in case new fields were added)
+        cfg = {**DEFAULT_CONFIG, **saved}
+        return cfg
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+# ============================================================
+# Shell 命令执行
+# ============================================================
+def sh(cmd, capture=False, check=True, quiet=False):
+    """执行 shell 命令"""
+    if not quiet:
+        print(f"{C.DIM}$ {cmd}{C.END}")
+    if capture:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if check and r.returncode != 0:
+            err(f"Command failed: {r.stderr.strip()}")
+            sys.exit(1)
+        return r.stdout.strip()
+    else:
+        r = subprocess.run(cmd, shell=True)
+        if check and r.returncode != 0:
+            err(f"Command failed with exit code {r.returncode}")
+            sys.exit(1)
+        return r.returncode
+
+def sh_no_fail(cmd, capture=True, quiet=True):
+    """执行命令，失败不退出"""
+    return subprocess.run(cmd, shell=True, capture_output=capture, text=True)
+
+# ============================================================
+# Vast.ai 操作
+# ============================================================
+def vast_get_instance(cfg):
+    """获取实例信息"""
+    iid = cfg["instance_id"]
+    if not iid:
+        err("还没配置实例 ID。先跑 ./gpu setup")
+        sys.exit(1)
+    r = sh_no_fail(f"vastai show instances --raw")
+    if r.returncode != 0:
+        err("vastai CLI 连不上，检查 API key")
+        sys.exit(1)
+    try:
+        instances = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        err(f"无法解析 vastai 输出: {r.stdout[:200]}")
+        sys.exit(1)
+    for inst in instances:
+        if str(inst.get("id")) == str(iid):
+            return inst
+    err(f"找不到实例 {iid}。可能已被销毁，跑 ./gpu setup 重新配置")
+    sys.exit(1)
+
+def vast_status(cfg):
+    """返回实例状态：running / stopped / exited 等"""
+    inst = vast_get_instance(cfg)
+    return inst.get("actual_status", "unknown")
+
+def vast_ssh_info(cfg):
+    """获取 SSH 连接信息 (host, port)"""
+    r = sh(f"vastai ssh-url {cfg['instance_id']}", capture=True, quiet=True)
+    # 格式可能是: ssh -p 12345 root@1.2.3.4  或  ssh://root@1.2.3.4:12345
+    port_match = re.search(r'-p\s+(\d+)', r)
+    host_match = re.search(r'@([\d.]+)', r)
+    if port_match and host_match:
+        return host_match.group(1), port_match.group(1)
+    # 尝试 ssh:// 格式
+    url_match = re.search(r'@([\d.]+):(\d+)', r)
+    if url_match:
+        return url_match.group(1), url_match.group(2)
+    err(f"无法解析 SSH 地址: {r}")
+    sys.exit(1)
+
+def ssh_cmd(cfg, extra=""):
+    """构建 SSH 命令前缀"""
+    host, port = vast_ssh_info(cfg)
+    key = cfg["ssh_key"]
+    return (
+        f"ssh -o StrictHostKeyChecking=no "
+        f"-o UserKnownHostsFile=/dev/null "
+        f"-o LogLevel=ERROR "
+        f"-i {key} "
+        f"-p {port} root@{host} {extra}"
+    )
+
+def rsync_cmd(cfg, src, dst, download=True):
+    """构建 rsync 命令"""
+    host, port = vast_ssh_info(cfg)
+    key = cfg["ssh_key"]
+    ssh_part = (
+        f"ssh -o StrictHostKeyChecking=no "
+        f"-o UserKnownHostsFile=/dev/null "
+        f"-o LogLevel=ERROR "
+        f"-i {key} "
+        f"-p {port}"
+    )
+    if download:
+        return f'rsync -avz --progress -e "{ssh_part}" root@{host}:{src} {dst}'
+    else:
+        return f'rsync -avz --progress -e "{ssh_part}" {src} root@{host}:{dst}'
+
+# ============================================================
+# 核心操作
+# ============================================================
+def ensure_running(cfg):
+    """确保实例在运行，不在就启动"""
+    status = vast_status(cfg)
+    if status == "running":
+        ok("实例已在运行")
+        return
+    if status in ("stopped", "exited", "created"):
+        info(f"实例状态: {status}，正在启动...")
+        sh(f"vastai start instance {cfg['instance_id']}", quiet=True)
+        wait = cfg["startup_wait_seconds"]
+        info(f"等待 {wait} 秒...")
+        for i in range(wait, 0, -5):
+            time.sleep(5)
+            s = vast_status(cfg)
+            if s == "running":
+                ok("实例已启动")
+                return
+            print(f"  {C.DIM}{i-5}s remaining... (status: {s}){C.END}")
+        # 最终检查
+        if vast_status(cfg) != "running":
+            err("实例启动超时，请手动检查 vast.ai 网页")
+            sys.exit(1)
+        ok("实例已启动")
+    else:
+        err(f"实例状态异常: {status}")
+        sys.exit(1)
+
+def ensure_stopped(cfg):
+    """确保实例已停止"""
+    status = vast_status(cfg)
+    if status == "running":
+        info("正在关机...")
+        sh(f"vastai stop instance {cfg['instance_id']}", quiet=True)
+        ok("实例已关机，GPU 停止计费")
+    else:
+        ok(f"实例已经是 {status} 状态")
+
+def git_push_local():
+    """确保本地代码已提交并推送"""
+    r = sh_no_fail("git status --porcelain")
+    if r.stdout.strip():
+        warn("检测到未提交的更改：")
+        print(r.stdout)
+        answer = input(f"{C.YELLOW}自动 commit 并 push？(y/n): {C.END}").strip().lower()
+        if answer == "y":
+            sh('git add .')
+            msg = input(f"{C.CYAN}commit message: {C.END}").strip() or "auto commit before training"
+            sh(f'git commit -m "{msg}"')
+        else:
+            err("请先手动 commit 再跑训练")
+            sys.exit(1)
+    sh("git push", check=True)
+    ok("代码已推送到 GitHub")
+
+def remote_sync_and_setup(cfg):
+    """远程拉代码、装依赖"""
+    project_dir = cfg["remote_project_dir"]
+    repo = cfg["github_repo"]
+
+    # 构建远程命令
+    commands = f"""
+    set -e
+    if [ -d "{project_dir}" ]; then
+        cd {project_dir}
+        git pull
+        echo "PULLED"
+    else
+        mkdir -p $(dirname {project_dir})
+        git clone {repo} {project_dir}
+        cd {project_dir}
+        echo "CLONED"
+    fi
+    """
+
+    if cfg["auto_install_deps"]:
+        commands += f"""
+    if [ -f requirements.txt ]; then
+        pip install -r requirements.txt -q 2>/dev/null
+        echo "DEPS_INSTALLED"
+    fi
+    """
+
+    sh(f'{ssh_cmd(cfg)} "bash -c \'{commands}\'"')
+    ok("远程代码同步完成")
+
+def remote_exec(cfg, command):
+    """在远程执行命令"""
+    project_dir = cfg["remote_project_dir"]
+    full_cmd = f'cd {project_dir} && {command}'
+    sh(f'{ssh_cmd(cfg)} "{full_cmd}"')
+
+def download_results(cfg, remote_path=None):
+    """下载训练结果"""
+    project_dir = cfg["remote_project_dir"]
+    local_dir = cfg["local_results_dir"]
+
+    if remote_path:
+        # 下载指定文件/目录
+        src = f"{project_dir}/{remote_path}"
+        dst = remote_path
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        sh(rsync_cmd(cfg, src, dst, download=True))
+    else:
+        # 下载整个 results 目录
+        src = f"{project_dir}/results/"
+        os.makedirs(local_dir, exist_ok=True)
+        sh(rsync_cmd(cfg, src, f"{local_dir}/", download=True))
+    ok("结果下载完成")
+
+# ============================================================
+# 命令处理
+# ============================================================
+def cmd_setup(args):
+    """首次配置"""
+    print(f"\n{C.BOLD}=== GPU 工具首次配置 ==={C.END}\n")
+
+    cfg = load_config()
+
+    # 检查 vastai CLI
+    r = sh_no_fail("which vastai")
+    if r.returncode != 0:
+        info("安装 vastai CLI...")
+        sh("pip install vastai")
+
+    # API Key
+    r = sh_no_fail("vastai show user --raw", quiet=True)
+    if r.returncode != 0:
+        print(f"\n{C.YELLOW}需要 Vast.ai API Key{C.END}")
+        print("  1. 打开 https://cloud.vast.ai/account/")
+        print("  2. 复制 API Key")
+        api_key = input(f"\n{C.CYAN}API Key: {C.END}").strip()
+        sh(f"vastai set api-key {api_key}", quiet=True)
+    ok("Vast.ai CLI 已配置")
+
+    # Instance ID
+    print(f"\n{C.YELLOW}你的 Vast.ai 实例：{C.END}")
+    sh("vastai show instances")
+    cfg["instance_id"] = input(f"\n{C.CYAN}输入实例 ID（如果还没有，先去 cloud.vast.ai 租一台）: {C.END}").strip()
+
+    # GitHub repo
+    print(f"\n{C.YELLOW}GitHub 仓库地址{C.END}")
+    print("  推荐用 HTTPS + token 格式：https://TOKEN@github.com/user/repo.git")
+    print("  这样远程 git pull 不用每次输密码")
+    cfg["github_repo"] = input(f"\n{C.CYAN}仓库地址: {C.END}").strip()
+
+    # 项目目录
+    default_dir = cfg["remote_project_dir"]
+    d = input(f"{C.CYAN}远程项目目录 [{default_dir}]: {C.END}").strip()
+    if d:
+        cfg["remote_project_dir"] = d
+
+    # 训练脚本
+    default_script = cfg["train_script"]
+    s = input(f"{C.CYAN}默认训练脚本 [{default_script}]: {C.END}").strip()
+    if s:
+        cfg["train_script"] = s
+
+    # SSH key
+    default_key = cfg["ssh_key"]
+    k = input(f"{C.CYAN}SSH 私钥路径 [{default_key}]: {C.END}").strip()
+    if k:
+        cfg["ssh_key"] = k
+
+    save_config(cfg)
+    ok(f"配置已保存到 {CONFIG_FILE}")
+    print(f"\n{C.GREEN}配置完成！现在可以用以下命令：{C.END}")
+    print(f"  ./gpu train              一键训练")
+    print(f"  ./gpu ssh                SSH 连接")
+    print(f"  ./gpu status             查看状态")
+
+def cmd_train(args):
+    """一键训练"""
+    cfg = load_config()
+    train_script = cfg["train_script"]
+    extra_args = ""
+
+    # 解析参数：--script 指定脚本，其余传给训练脚本
+    remaining = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--script" and i + 1 < len(args):
+            train_script = args[i + 1]
+            i += 2
+        else:
+            remaining.append(args[i])
+            i += 1
+    extra_args = " ".join(remaining)
+
+    start_time = time.time()
+
+    step(1, "检查并推送本地代码")
+    git_push_local()
+
+    step(2, "启动 GPU 实例")
+    ensure_running(cfg)
+
+    step(3, "同步代码到远程")
+    remote_sync_and_setup(cfg)
+
+    step(4, f"开始训练: {train_script} {extra_args}")
+    train_cmd = f"python {train_script} {extra_args}"
+    print(f"\n{C.BOLD}{'='*50}{C.END}")
+    try:
+        remote_exec(cfg, train_cmd)
+    except SystemExit:
+        warn("训练被中断")
+        answer = input(f"{C.YELLOW}要关机吗？(y/n): {C.END}").strip().lower()
+        if answer == "y":
+            ensure_stopped(cfg)
+        sys.exit(1)
+    print(f"{C.BOLD}{'='*50}{C.END}\n")
+
+    step(5, "下载训练结果")
+    try:
+        download_results(cfg)
+    except SystemExit:
+        warn("结果下载失败（可能没有 results 目录），跳过")
+
+    if cfg["auto_shutdown"]:
+        step(6, "关闭 GPU 实例")
+        ensure_stopped(cfg)
+
+    elapsed = time.time() - start_time
+    minutes = elapsed / 60
+    cost_estimate = (elapsed / 3600) * 0.34  # 假设 $0.34/hr
+
+    print(f"\n{C.GREEN}{'='*50}{C.END}")
+    print(f"{C.GREEN}  训练完成！{C.END}")
+    print(f"  耗时: {minutes:.1f} 分钟")
+    print(f"  预估费用: ${cost_estimate:.2f} (≈ £{cost_estimate * 0.79:.2f})")
+    print(f"  结果保存在: {cfg['local_results_dir']}/")
+    print(f"{C.GREEN}{'='*50}{C.END}")
+
+def cmd_run(args):
+    """远程执行任意命令"""
+    cfg = load_config()
+    if not args:
+        err("用法: ./gpu run <command>")
+        err('示例: ./gpu run "nvidia-smi"')
+        sys.exit(1)
+
+    command = " ".join(args)
+
+    ensure_running(cfg)
+    info(f"执行: {command}")
+    remote_exec(cfg, command)
+
+    answer = input(f"\n{C.YELLOW}要关机吗？(y/n): {C.END}").strip().lower()
+    if answer == "y":
+        ensure_stopped(cfg)
+
+def cmd_ssh(args):
+    """SSH 连接"""
+    cfg = load_config()
+    ensure_running(cfg)
+    project_dir = cfg["remote_project_dir"]
+    info("连接中... (exit 退出后记得 ./gpu down 关机)")
+    os.system(f'{ssh_cmd(cfg)} -t "cd {project_dir} 2>/dev/null; exec bash --login"')
+    print()
+    warn("你已退出 SSH。实例仍在运行！")
+    answer = input(f"{C.YELLOW}要关机吗？(y/n): {C.END}").strip().lower()
+    if answer == "y":
+        ensure_stopped(cfg)
+
+def cmd_up(args):
+    """启动实例"""
+    cfg = load_config()
+    ensure_running(cfg)
+
+def cmd_down(args):
+    """关闭实例"""
+    cfg = load_config()
+    ensure_stopped(cfg)
+
+def cmd_status(args):
+    """查看实例状态"""
+    cfg = load_config()
+    inst = vast_get_instance(cfg)
+    status = inst.get("actual_status", "unknown")
+
+    status_color = C.GREEN if status == "running" else C.YELLOW
+    gpu = inst.get("gpu_name", "unknown")
+    cost = inst.get("dph_total", 0)
+
+    print(f"\n  实例 ID:   {cfg['instance_id']}")
+    print(f"  状态:      {status_color}{status}{C.END}")
+    print(f"  GPU:       {gpu}")
+    print(f"  费率:      ${cost:.3f}/hr (≈ £{cost * 0.79:.3f}/hr)")
+
+    if status == "running":
+        warn("实例正在运行，正在计费！")
+    print()
+
+def cmd_download(args):
+    """下载文件"""
+    cfg = load_config()
+    ensure_running(cfg)
+    remote_path = args[0] if args else None
+    download_results(cfg, remote_path)
+
+def cmd_destroy(args):
+    """销毁实例"""
+    cfg = load_config()
+    warn("这会永久删除远程所有数据！")
+    answer = input(f"{C.RED}确定要销毁实例 {cfg['instance_id']}？(输入 yes): {C.END}").strip()
+    if answer == "yes":
+        sh(f"vastai destroy instance {cfg['instance_id']}", quiet=True)
+        ok("实例已销毁。跑 ./gpu setup 重新配置。")
+    else:
+        info("取消操作")
+
+def cmd_cost(args):
+    """查看花费"""
+    cfg = load_config()
+    # vastai 没有直接的 cost API，展示当前费率
+    inst = vast_get_instance(cfg)
+    cost_hr = inst.get("dph_total", 0)
+    status = inst.get("actual_status", "unknown")
+    storage_cost = inst.get("storage_cost", 0)
+
+    print(f"\n  {C.BOLD}费用估算{C.END}")
+    print(f"  GPU 费率:    ${cost_hr:.3f}/hr")
+    print(f"  存储费用:    ${storage_cost:.4f}/hr")
+    print(f"  状态:        {status}")
+
+    if status == "running":
+        print(f"\n  {C.YELLOW}⚠ 实例运行中，每小时 ${cost_hr:.2f}{C.END}")
+        print(f"  如果跑 1 小时: ${cost_hr:.2f}")
+        print(f"  如果跑 4 小时: ${cost_hr * 4:.2f}")
+        print(f"  如果跑 24 小时: ${cost_hr * 24:.2f}")
+    else:
+        print(f"\n  {C.GREEN}✓ 实例已停止，只收存储费{C.END}")
+    print()
+
+# ============================================================
+# 入口
+# ============================================================
+COMMANDS = {
+    "setup":    (cmd_setup,   "首次配置"),
+    "train":    (cmd_train,   "一键训练（push → 开机 → 训练 → 下载 → 关机）"),
+    "run":      (cmd_run,     "远程执行命令"),
+    "ssh":      (cmd_ssh,     "SSH 连接到实例"),
+    "up":       (cmd_up,      "启动实例"),
+    "down":     (cmd_down,    "关闭实例（停止 GPU 计费）"),
+    "status":   (cmd_status,  "查看实例状态"),
+    "download": (cmd_download,"下载远程文件"),
+    "destroy":  (cmd_destroy, "销毁实例（删除所有数据）"),
+    "cost":     (cmd_cost,    "查看费用估算"),
+}
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(f"\n{C.BOLD}gpu - 一站式远程 GPU 训练工具{C.END}\n")
+        print(f"用法: ./gpu <command> [args]\n")
+        print(f"命令:")
+        for name, (_, desc) in COMMANDS.items():
+            print(f"  {C.CYAN}{name:12s}{C.END}  {desc}")
+        print(f"\n示例:")
+        print(f"  ./gpu setup                          首次配置")
+        print(f"  ./gpu train                          默认参数训练")
+        print(f"  ./gpu train --epochs 100 --lr 0.001  自定义参数")
+        print(f"  ./gpu train --script eval.py         跑别的脚本")
+        print(f"  ./gpu ssh                            SSH 进去")
+        print(f"  ./gpu run \"nvidia-smi\"               远程执行命令")
+        print(f"  ./gpu down                           关机省钱")
+        print()
+        sys.exit(0)
+
+    cmd_name = sys.argv[1]
+    cmd_args = sys.argv[2:]
+
+    if cmd_name not in COMMANDS:
+        err(f"未知命令: {cmd_name}")
+        info(f"运行 ./gpu help 查看所有命令")
+        sys.exit(1)
+
+    handler, _ = COMMANDS[cmd_name]
+    handler(cmd_args)
+
+if __name__ == "__main__":
+    main()
