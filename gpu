@@ -308,61 +308,64 @@ def download_results(cfg, remote_path=None):
 # ============================================================
 def cmd_setup(args):
     """首次配置"""
-    print(f"\n{C.BOLD}=== GPU 工具首次配置 ==={C.END}\n")
+    print(f"\n{C.BOLD}=== GPU 工具配置 ==={C.END}\n")
 
-    cfg = load_config()
+    global_cfg_path = CONFIG_DIR / "config.json"
+    if global_cfg_path.exists():
+        with open(global_cfg_path) as f:
+            global_cfg = json.load(f)
+        info("复用全局配置（instance_id / token / ssh_key）")
+        cfg = {**DEFAULT_CONFIG, **global_cfg}
+    else:
+        cfg = DEFAULT_CONFIG.copy()
+        # 首次需要手动填
+        r = sh_no_fail("which vastai")
+        if r.returncode != 0:
+            sh("pip install vastai")
 
-    # 检查 vastai CLI
-    r = sh_no_fail("which vastai")
-    if r.returncode != 0:
-        info("安装 vastai CLI...")
-        sh("pip install vastai")
+        r = sh_no_fail("vastai show user --raw", quiet=True)
+        if r.returncode != 0:
+            api_key = input(f"{C.CYAN}Vast.ai API Key: {C.END}").strip()
+            sh(f"vastai set api-key {api_key}", quiet=True)
 
-    # API Key
-    r = sh_no_fail("vastai show user --raw", quiet=True)
-    if r.returncode != 0:
-        print(f"\n{C.YELLOW}需要 Vast.ai API Key{C.END}")
-        print("  1. 打开 https://cloud.vast.ai/account/")
-        print("  2. 复制 API Key")
-        api_key = input(f"\n{C.CYAN}API Key: {C.END}").strip()
-        sh(f"vastai set api-key {api_key}", quiet=True)
-    ok("Vast.ai CLI 已配置")
+        sh("vastai show instances")
+        cfg["instance_id"] = input(f"{C.CYAN}实例 ID: {C.END}").strip()
 
-    # Instance ID
-    print(f"\n{C.YELLOW}你的 Vast.ai 实例：{C.END}")
-    sh("vastai show instances")
-    cfg["instance_id"] = input(f"\n{C.CYAN}输入实例 ID（如果还没有，先去 cloud.vast.ai 租一台）: {C.END}").strip()
+        print(f"\n{C.YELLOW}GitHub token（只需输入一次，以后自动复用）{C.END}")
+        print("  格式：ghp_xxxxxxxxxxxx")
+        cfg["github_token"] = input(f"{C.CYAN}Token: {C.END}").strip()
 
-    # GitHub repo
-    print(f"\n{C.YELLOW}GitHub 仓库地址{C.END}")
-    print("  推荐用 HTTPS + token 格式：https://TOKEN@github.com/user/repo.git")
-    print("  这样远程 git pull 不用每次输密码")
-    cfg["github_repo"] = input(f"\n{C.CYAN}仓库地址: {C.END}").strip()
+        default_key = str(Path.home() / ".ssh/id_ed25519")
+        k = input(f"{C.CYAN}SSH 私钥路径 [{default_key}]: {C.END}").strip()
+        cfg["ssh_key"] = k or default_key
 
-    # 项目目录
-    default_dir = cfg["remote_project_dir"]
-    d = input(f"{C.CYAN}远程项目目录 [{default_dir}]: {C.END}").strip()
-    if d:
-        cfg["remote_project_dir"] = d
+    # 自动推断项目名和仓库地址
+    project_name = Path.cwd().name
+    token = cfg.get("github_token", "")
+
+    # 从 git remote 检测用户名/仓库名
+    r = sh_no_fail("git remote get-url origin", quiet=True)
+    if r.returncode == 0:
+        remote_url = r.stdout.strip()
+        # 提取 github.com/user/repo.git 部分
+        import re as _re
+        match = _re.search(r'github\.com[:/](.+?)(?:\.git)?$', remote_url)
+        if match:
+            repo_path = match.group(1)
+            cfg["github_repo"] = f"https://{token}@github.com/{repo_path}.git"
+            ok(f"仓库: github.com/{repo_path}")
+
+    cfg["remote_project_dir"] = f"/root/projects/{project_name}"
+    ok(f"远程目录: /root/projects/{project_name}")
 
     # 训练脚本
-    default_script = cfg["train_script"]
+    default_script = cfg.get("train_script", "train.py")
     s = input(f"{C.CYAN}默认训练脚本 [{default_script}]: {C.END}").strip()
-    if s:
-        cfg["train_script"] = s
-
-    # SSH key
-    default_key = cfg["ssh_key"]
-    k = input(f"{C.CYAN}SSH 私钥路径 [{default_key}]: {C.END}").strip()
-    if k:
-        cfg["ssh_key"] = k
+    cfg["train_script"] = s or default_script
 
     save_config(cfg)
-    ok(f"配置已保存到 {CONFIG_FILE}")
-    print(f"\n{C.GREEN}配置完成！现在可以用以下命令：{C.END}")
-    print(f"  ./gpu train              一键训练")
-    print(f"  ./gpu ssh                SSH 连接")
-    print(f"  ./gpu status             查看状态")
+    ok("配置完成")
+
 
 def cmd_train(args):
     """一键训练"""
