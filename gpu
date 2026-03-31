@@ -397,7 +397,10 @@ def cmd_train(args):
     remote_sync_and_setup(cfg)
 
     step(4, f"开始训练: {train_script} {extra_args}")
-    train_cmd = f"python {train_script} {extra_args}"
+    if train_script.endswith(".sh"):
+        train_cmd = f"bash {train_script} {extra_args}"
+    else:
+        train_cmd = f"python {train_script} {extra_args}"
     print(f"\n{C.BOLD}{'='*50}{C.END}")
     try:
         remote_exec(cfg, train_cmd)
